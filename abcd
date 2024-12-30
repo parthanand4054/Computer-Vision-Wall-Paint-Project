@@ -1,0 +1,12 @@
+
+The system begins with frame capture through ARKit's camera feed. When a frame arrives, it's processed through ARFrameDelegate in ShelfScanVM, which maintains queue management to prevent frame processing overlap. Each captured frame is a CVPixelBuffer that gets processed for object detection.
+
+The core detection happens in ProductEmbedder, which implements two ML models: a YOLOv8 model for object detection and an transformer model for product recognition. The YOLO model processes frames, outputting detection data. This output is parsed to get bounding box coordinates, confidence scores, and dimensions.
+
+For each valid detection the system crops and preprocesses the region for embedding generation. The embedding model creates feature vectors that EmbeddingMatcher uses to identify products. Product matching uses a similarity algorithm against a database of known embeddings. 
+
+The AR visualization is handled through ARSCNView which loads a SceneKit scene containing 3D product models and information panels. The system maintains relative positioning between scene nodes by tracking spatial relationships between product models (Cheerios, Honey Bunch) and their information panels. When products are detected and matched the corresponding 3D models are positioned in AR space with some transformations.
+
+Information display combines AR visualization with product data managed by ProductVM. Product details are loaded from the JSON file and include name, price, ratings, descriptions, and allergen information. The system implements billboard constraints to maintain readability of text elements in 3D space and handles user interaction through rotation gesture recognizers.
+
+For debugging and development, we have included BoundingBoxView for detection visualization and boundingbox adjustment controls. YOLODebugView showcases ML model's processing of frames.
