@@ -1,89 +1,14 @@
-import SwiftUI
-import Compression
+// 1) Drop this type anywhere in the same file
+final class InsecureTLSDelegate: NSObject, URLSessionDelegate {
+    func urlSession(_ session: URLSession,
+                    didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
 
-struct ContentView: View {
-    @State private var console = "Fetching…"
-
-    var body: some View {
-        ScrollView {                     // simple on-screen log (optional)
-            Text(console)
-                .font(.system(.body, design: .monospaced))
-                .padding()
-        }
-        .onAppear { fetch() }            // fire once at launch
-    }
-
-    // MARK: – Networking
-    private func fetch() {
-        guard let url = URL(string:
-            "https://developer.api.us.stg.walmart.com/api-proxy/service/COMPASS/SERVICE/v4/embeddings/upc?upc_id=7062240121"
-        ) else { return }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue(
-            "YOUR-CONSUMER-ID-HERE",                 // TODO ①
-            forHTTPHeaderField: "wm_consumer.id"
-        )
-        request.setValue(
-            "Bearer YOUR-JWT-TOKEN-HERE",           // TODO ②
-            forHTTPHeaderField: "Authorization"
-        )
-
-        // URLSession transparently ungzips when the server sets `Content-Encoding: gzip`
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            if let error { log("❌ \(error.localizedDescription)") ; return }
-            guard let data else { log("❌ No data") ; return }
-
-            // If URLSession already decompressed, this succeeds; otherwise fallback to manual gunzip
-            if let pretty = prettyPrintedJSON(from: data) {
-                log("✅ Response (decompressed automatically)\n\(pretty)")
-            } else if let gunzipped = data.gunzip(),
-                      let pretty = prettyPrintedJSON(from: gunzipped) {
-                log("✅ Response (manual gunzip)\n\(pretty)")
-            } else {
-                log("⚠️ Could not decode JSON – raw bytes count: \(data.count)")
-            }
-        }.resume()
-    }
-
-    // MARK: – Helpers
-    private func log(_ text: String) {
-        DispatchQueue.main.async { console = text ; print(text) }
-    }
-}
-
-import Foundation
-
-/// Pretty-print any JSON blob so it’s readable in the console
-private func prettyPrintedJSON(from data: Data) -> String? {
-    guard let obj = try? JSONSerialization.jsonObject(with: data),
-          let pretty = try? JSONSerialization.data(withJSONObject: obj, options: .prettyPrinted),
-          let str = String(data: pretty, encoding: .utf8) else { return nil }
-    return str
-}
-
-/// Very small gzip-decompressor using Apple’s Compression framework
-private extension Data {
-    func gunzip() -> Data? {
-        guard !isEmpty else { return self }
-
-        return withUnsafeBytes { (srcPtr: UnsafeRawBufferPointer) -> Data? in
-            guard let srcBase = srcPtr.baseAddress else { return nil }
-            // Allocate a worst-case 4× buffer; adjust if you know the size
-            let dstSize = count * 4
-            let dstPtr = UnsafeMutablePointer<UInt8>.allocate(capacity: dstSize)
-            defer { dstPtr.deallocate() }
-
-            let decompressed = compression_decode_buffer(
-                dstPtr, dstSize,
-                srcBase.assumingMemoryBound(to: UInt8.self), count,
-                nil,
-                COMPRESSION_ZLIB       // gzip uses the deflate algorithm
-            )
-
-            guard decompressed != 0 else { return nil }
-            return Data(bytes: dstPtr, count: decompressed)
+        if let trust = challenge.protectionSpace.serverTrust {
+            // Accept *whatever* the server presents
+            completionHandler(.useCredential, URLCredential(trust: trust))
+        } else {
+            completionHandler(.performDefaultHandling, nil)
         }
     }
 }
