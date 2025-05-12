@@ -1,29 +1,127 @@
-private func fetch() {
-    guard let url = URL(string:
-        "https://developer.api.us.stg.walmart.com/api-proxy/service/COMPASS/SERVICE/v4/embeddings/upc?upc_id=7062240121"
-    ) else { return }
+import SwiftUI
+import Compression
 
-    var request = URLRequest(url: url)
-    request.httpMethod = "GET"
-    request.setValue("YOUR-CONSUMER-ID-HERE", forHTTPHeaderField: "wm_consumer.id")
-    request.setValue("Bearer YOUR-JWT-TOKEN-HERE", forHTTPHeaderField: "Authorization")
+struct ContentView: View {
+    @State private var console = "Fetching…"
 
-    // ⟹ use a custom session that trusts the staging cert
-    let session = URLSession(configuration: .default,
-                             delegate: InsecureTLSDelegate(),
-                             delegateQueue: nil)
-
-    session.dataTask(with: request) { data, response, error in
-        if let error { log("❌ \(error.localizedDescription)"); return }
-        guard let data else { log("❌ No data"); return }
-
-        if let pretty = prettyPrintedJSON(from: data) {
-            log("✅ Response (auto-unzipped)\n\(pretty)")
-        } else if let gunzipped = data.gunzip(),
-                  let pretty = prettyPrintedJSON(from: gunzipped) {
-            log("✅ Response (manual gunzip)\n\(pretty)")
-        } else {
-            log("⚠️ Could not decode JSON – raw bytes count: \(data.count)")
+    var body: some View {
+        ScrollView {
+            Text(console)
+                .font(.system(.body, design: .monospaced))
+                .padding()
         }
-    }.resume()
+        .onAppear { fetch() }
+    }
+
+    // MARK: – Networking
+    private func fetch() {
+        guard let url = URL(string:
+            "https://developer.api.us.stg.walmart.com/api-proxy/service/COMPASS/SERVICE/v4/embeddings/upc?upc_id=7062240121"
+        ) else { return }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("YOUR-CONSUMER-ID-HERE",                 // TODO Ⓐ
+                         forHTTPHeaderField: "wm_consumer.id")
+        request.setValue("Bearer YOUR-JWT-TOKEN-HERE",            // TODO Ⓑ
+                         forHTTPHeaderField: "Authorization")
+
+        // custom session that trusts Walmart’s staging cert
+        let session = URLSession(configuration: .default,
+                                 delegate: InsecureTLSDelegate(),
+                                 delegateQueue: nil)
+
+        session.dataTask(with: request) { data, response, error in
+            if let error { log("❌ \(error.localizedDescription)"); return }
+            guard let data else { log("❌ No data"); return }
+
+            // 1️⃣ print the wrapper JSON
+            if let pretty = prettyPrintedJSON(from: data) {
+                log("✅ Response (outer JSON)\n\(pretty)")
+            } else {
+                log("⚠️ Outer data not JSON (bytes: \(data.count))")
+            }
+
+            // 2️⃣ dig into payload → base-64 → gunzip
+            if let unpacked = unpackPayload(from: data) {
+                log(unpacked)
+            } else {
+                log("⚠️ Could not unpack payload")
+            }
+        }.resume()
+    }
+
+    // MARK: – Helpers
+    private func log(_ text: String) {
+        DispatchQueue.main.async {
+            console = text
+            print(text)          // also to Xcode console
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// MARK: - TLS delegate that blindly trusts the server cert (debug-only)
+
+final class InsecureTLSDelegate: NSObject, URLSessionDelegate {
+    func urlSession(_ session: URLSession,
+                    didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        if let trust = challenge.protectionSpace.serverTrust {
+            completionHandler(.useCredential, URLCredential(trust: trust))
+        } else {
+            completionHandler(.performDefaultHandling, nil)
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// MARK: - Data transformation helpers
+
+/// Nicely indents any JSON blob; returns nil if `data` isn’t JSON
+private func prettyPrintedJSON(from data: Data) -> String? {
+    guard
+        let obj = try? JSONSerialization.jsonObject(with: data),
+        let pretty = try? JSONSerialization.data(withJSONObject: obj, options: .prettyPrinted),
+        let string = String(data: pretty, encoding: .utf8)
+    else { return nil }
+    return string
+}
+
+/// tiny gzip-decompressor using Apple’s Compression framework
+private extension Data {
+    func gunzip() -> Data? {
+        guard !isEmpty else { return self }
+        return withUnsafeBytes { srcPtr -> Data? in
+            guard let srcBase = srcPtr.baseAddress else { return nil }
+            let dstSize = count * 4               // rough guess
+            let dstPtr = UnsafeMutablePointer<UInt8>.allocate(capacity: dstSize)
+            defer { dstPtr.deallocate() }
+
+            let len = compression_decode_buffer(
+                dstPtr, dstSize,
+                srcBase.assumingMemoryBound(to: UInt8.self), count,
+                nil, COMPRESSION_ZLIB
+            )
+            return len == 0 ? nil : Data(bytes: dstPtr, count: len)
+        }
+    }
+}
+
+/// Extracts `"payload"` → base-64 → gunzip → pretty-print (if JSON)
+private func unpackPayload(from root: Data) -> String? {
+    // 1. Parse outer JSON
+    guard
+        let obj = try? JSONSerialization.jsonObject(with: root) as? [String: Any],
+        let payloadB64 = obj["payload"] as? String,
+        let gzData = Data(base64Encoded: payloadB64),  // 2. base-64 decode
+        let raw = gzData.gunzip()                      // 3. gunzip
+    else { return nil }
+
+    // 4. Try to pretty-print as JSON, otherwise just show byte count
+    if let pretty = prettyPrintedJSON(from: raw) {
+        return "📦 Inner payload (decompressed JSON)\n\(pretty)"
+    } else {
+        return "📦 Inner payload is \(raw.count) raw bytes (non-JSON?)"
+    }
 }
