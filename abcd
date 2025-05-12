@@ -1,127 +1,40 @@
-import SwiftUI
-import Compression
-
-struct ContentView: View {
-    @State private var console = "Fetching…"
-
-    var body: some View {
-        ScrollView {
-            Text(console)
-                .font(.system(.body, design: .monospaced))
-                .padding()
-        }
-        .onAppear { fetch() }
-    }
-
-    // MARK: – Networking
-    private func fetch() {
-        guard let url = URL(string:
-            "https://developer.api.us.stg.walmart.com/api-proxy/service/COMPASS/SERVICE/v4/embeddings/upc?upc_id=7062240121"
-        ) else { return }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue("YOUR-CONSUMER-ID-HERE",                 // TODO Ⓐ
-                         forHTTPHeaderField: "wm_consumer.id")
-        request.setValue("Bearer YOUR-JWT-TOKEN-HERE",            // TODO Ⓑ
-                         forHTTPHeaderField: "Authorization")
-
-        // custom session that trusts Walmart’s staging cert
-        let session = URLSession(configuration: .default,
-                                 delegate: InsecureTLSDelegate(),
-                                 delegateQueue: nil)
-
-        session.dataTask(with: request) { data, response, error in
-            if let error { log("❌ \(error.localizedDescription)"); return }
-            guard let data else { log("❌ No data"); return }
-
-            // 1️⃣ print the wrapper JSON
-            if let pretty = prettyPrintedJSON(from: data) {
-                log("✅ Response (outer JSON)\n\(pretty)")
-            } else {
-                log("⚠️ Outer data not JSON (bytes: \(data.count))")
-            }
-
-            // 2️⃣ dig into payload → base-64 → gunzip
-            if let unpacked = unpackPayload(from: data) {
-                log(unpacked)
-            } else {
-                log("⚠️ Could not unpack payload")
-            }
-        }.resume()
-    }
-
-    // MARK: – Helpers
-    private func log(_ text: String) {
-        DispatchQueue.main.async {
-            console = text
-            print(text)          // also to Xcode console
-        }
-    }
-}
-
-// ────────────────────────────────────────────────────────────────────────────────
-// MARK: - TLS delegate that blindly trusts the server cert (debug-only)
-
-final class InsecureTLSDelegate: NSObject, URLSessionDelegate {
-    func urlSession(_ session: URLSession,
-                    didReceive challenge: URLAuthenticationChallenge,
-                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-        if let trust = challenge.protectionSpace.serverTrust {
-            completionHandler(.useCredential, URLCredential(trust: trust))
-        } else {
-            completionHandler(.performDefaultHandling, nil)
-        }
-    }
-}
-
-// ────────────────────────────────────────────────────────────────────────────────
-// MARK: - Data transformation helpers
-
-/// Nicely indents any JSON blob; returns nil if `data` isn’t JSON
-private func prettyPrintedJSON(from data: Data) -> String? {
-    guard
-        let obj = try? JSONSerialization.jsonObject(with: data),
-        let pretty = try? JSONSerialization.data(withJSONObject: obj, options: .prettyPrinted),
-        let string = String(data: pretty, encoding: .utf8)
-    else { return nil }
-    return string
-}
-
-/// tiny gzip-decompressor using Apple’s Compression framework
-private extension Data {
-    func gunzip() -> Data? {
-        guard !isEmpty else { return self }
-        return withUnsafeBytes { srcPtr -> Data? in
-            guard let srcBase = srcPtr.baseAddress else { return nil }
-            let dstSize = count * 4               // rough guess
-            let dstPtr = UnsafeMutablePointer<UInt8>.allocate(capacity: dstSize)
-            defer { dstPtr.deallocate() }
-
-            let len = compression_decode_buffer(
-                dstPtr, dstSize,
-                srcBase.assumingMemoryBound(to: UInt8.self), count,
-                nil, COMPRESSION_ZLIB
-            )
-            return len == 0 ? nil : Data(bytes: dstPtr, count: len)
-        }
-    }
-}
-
 /// Extracts `"payload"` → base-64 → gunzip → pretty-print (if JSON)
 private func unpackPayload(from root: Data) -> String? {
-    // 1. Parse outer JSON
-    guard
-        let obj = try? JSONSerialization.jsonObject(with: root) as? [String: Any],
-        let payloadB64 = obj["payload"] as? String,
-        let gzData = Data(base64Encoded: payloadB64),  // 2. base-64 decode
-        let raw = gzData.gunzip()                      // 3. gunzip
-    else { return nil }
 
-    // 4. Try to pretty-print as JSON, otherwise just show byte count
+    // 1️⃣ Outer JSON
+    guard
+        let obj = try? JSONSerialization.jsonObject(with: root) as? [String: Any]
+    else { return "❌ outer JSON parse failed" }
+
+    guard
+        let payloadB64 = obj["payload"] as? String
+    else { return "❌ no \"payload\" key in outer JSON" }
+
+    // 2️⃣ Base-64 decode
+    guard
+        let gzData = Data(base64Encoded: payloadB64)
+    else { return "❌ base-64 decode failed (length \(payloadB64.count))" }
+
+    // 3️⃣ Gunzip  ➜  if this fails we’ll try the raw bytes as JSON
+    let raw = gzData.gunzip() ?? gzData
+
+    // 4️⃣ Pretty-print if JSON, otherwise dump some stats
     if let pretty = prettyPrintedJSON(from: raw) {
-        return "📦 Inner payload (decompressed JSON)\n\(pretty)"
+        return "📦 Inner payload (JSON, \(raw.count) bytes)\n\(pretty)"
+    } else if let str = String(data: raw, encoding: .utf8), str.isPrintable {
+        return "📦 Inner payload (UTF-8 text, \(raw.count) bytes)\n\(str)"
     } else {
-        return "📦 Inner payload is \(raw.count) raw bytes (non-JSON?)"
+        return "📦 Inner payload is \(raw.count) binary bytes (non-JSON/non-UTF-8)"
+    }
+}
+
+
+
+
+private extension String {
+    /// crude check: printable if at least 80 % of chars are ASCII 32…126
+    var isPrintable: Bool {
+        let printable = filter { $0.asciiValue ?? 0 >= 32 && $0.asciiValue ?? 0 <= 126 }
+        return Double(printable.count) / Double(count) > 0.8
     }
 }
