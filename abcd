@@ -1,43 +1,25 @@
-private extension Data {
-
-    /// Full GZIP inflator using zlib (windowBits = 16 + MAX_WBITS)
-    func fullGunzip() -> Data? {
-        guard !isEmpty else { return self }
-
-        // ── 1. initialise stream ─────────────────────────────
-        var stream = z_stream()
-        stream.next_in = UnsafeMutablePointer<Bytef>(mutating:
-            (self as NSData).bytes.bindMemory(to: Bytef.self, capacity: count))
-        stream.avail_in = uInt(count)
-
-        let windowBits = 16 + MAX_WBITS            // +16 = accept gzip header/trailer
-        guard inflateInit2_(&stream,
-                            Int32(windowBits),
-                            ZLIB_VERSION,
-                            Int32(MemoryLayout<z_stream>.size)) == Z_OK else { return nil }
-
-        // ── 2. inflate in 16 KB chunks ───────────────────────
-        var output = Data()
-        let chunkSize = 16 * 1024
-        var status: Int32 = Z_OK
-
-        while status == Z_OK {
-            var buffer = [UInt8](repeating: 0, count: chunkSize)
-
-            // hand the buffer’s raw pointer to zlib
-            buffer.withUnsafeMutableBytes { outPtr in
-                stream.next_out  = outPtr.bindMemory(to: Bytef.self).baseAddress
-                stream.avail_out = uInt(chunkSize)
-
-                status = inflate(&stream, Z_NO_FLUSH)
-
-                let written = chunkSize - Int(stream.avail_out)
-                output.append(outPtr.baseAddress!.assumingMemoryBound(to: UInt8.self),
-                              count: written)
-            }
-        }
-
-        inflateEnd(&stream)
-        return status == Z_STREAM_END ? output : nil
+/// Pretty hex + ASCII (16 bytes per line) – like `hexdump -C`
+private func hexDump(_ data: Data) -> String {
+    var out = ""
+    let bytes = [UInt8](data)
+    for i in stride(from: 0, to: bytes.count, by: 16) {
+        let chunk = bytes[i..<min(i+16, bytes.count)]
+        let hex   = chunk.map { String(format: "%02X", $0) }.joined(separator: " ")
+        let pad   = String(repeating: "   ", count: 16 - chunk.count)
+        let ascii = chunk.map { b -> Character in
+                       let c = Character(UnicodeScalar(b))
+                       return c.isASCII && c.unicodeScalars.first!.value >= 32 ? c : "."
+                   }
+        out += String(format: "%04X  %@%@  |%@|\n", i, hex, pad, String(ascii))
     }
+    return out
 }
+
+
+
+// 6. unknown binary  ➜  dump hex for inspection
+return """
+📦 Inner payload is \(bytes.count) binary bytes (unknown format)
+──────────────────────────────────────────────────────────────
+\(hexDump(bytes))
+"""
