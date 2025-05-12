@@ -1,49 +1,27 @@
-import requests
-import gzip
-import json
-import sys
+#!/bin/bash
 
-url = "https://developer.api.us.stg.walmart.com/api-proxy/service/COMPASS/SERVICE/v4/embeddings/upc"
-params = {"upc_id": "7062240121"}
-headers = {
-    "wm_consumer.id": "c061c52a-b978-4ae9-9875-6584e58e8a74",
-    "Authorization": "Bearer eyJraWQiOiJKOTY5MzBhY..."  # The long token from your screenshot
-}
+# Save response to file
+curl -s --location 'https://developer.api.us.stg.walmart.com/api-proxy/service/COMPASS/SERVICE/v4/embeddings/upc?upc_id=7062240121' \
+--header 'wm_consumer.id: c061c52a-b978-4ae9-9875-6584e58e8a74' \
+--header 'Authorization: Bearer eyJraWQiOiJKOTY5MzBhY...' \
+--output response.gz
 
-response = requests.get(url, params=params, headers=headers)
+# Check if file was downloaded
+if [ ! -f response.gz ]; then
+    echo "Failed to download file"
+    exit 1
+fi
 
-# Check if response is successful
-if response.status_code != 200:
-    print(f"Error: Received status code {response.status_code}")
-    print(response.text)
-    sys.exit(1)
+# Try to decompress
+gunzip -f response.gz
 
-try:
-    # Try to decompress the response
-    decompressed_data = gzip.decompress(response.content)
-    
-    # Parse as JSON
-    json_data = json.loads(decompressed_data)
-    
-    # Save to a file for later inspection
-    with open('embeddings_response.json', 'w') as f:
-        json.dump(json_data, f, indent=2)
-    
-    # Print summary of the data structure
-    print("Successfully fetched and decompressed data!")
-    print(f"Response saved to embeddings_response.json")
-    
-    # Show a sample of the structure
-    if isinstance(json_data, dict):
-        print(f"\nFound {len(json_data)} product keys in response")
-        for key in list(json_data.keys())[:3]:  # Show first 3 keys
-            embeddings = json_data[key]
-            print(f"  Product {key}: {len(embeddings)} embeddings, each with {len(embeddings[0])} dimensions")
-    
-except Exception as e:
-    print(f"Error processing response: {e}")
-    
-    # Save raw response for debugging
-    with open("raw_response.bin", "wb") as f:
-        f.write(response.content)
-    print("Raw response saved to raw_response.bin")
+# Check if decompression was successful
+if [ -f response ]; then
+    echo "Successfully decompressed response."
+    echo "First few lines of the response:"
+    head -n 20 response
+    echo "..."
+    echo "Full response saved to 'response' file"
+else
+    echo "Failed to decompress response"
+fi
