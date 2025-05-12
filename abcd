@@ -1,158 +1,43 @@
-import SwiftUI
-import Compression      // for the low-level gunzip helper
-import zlib             // needed for full GZIP support
-
-struct ContentView: View {
-    @State private var console = "Fetching…"
-
-    var body: some View {
-        ScrollView {
-            Text(console)
-                .font(.system(.body, design: .monospaced))
-                .padding()
-        }
-        .onAppear { fetch() }
-    }
-
-    // MARK: – Networking
-    private func fetch() {
-        guard let url = URL(string:
-            "https://developer.api.us.stg.walmart.com/api-proxy/service/COMPASS/SERVICE/v4/embeddings/upc?upc_id=7062240121"
-        ) else { return }
-
-        var req = URLRequest(url: url)
-        req.httpMethod = "GET"
-        req.setValue("YOUR-CONSUMER-ID-HERE",               // ← TODO ①
-                     forHTTPHeaderField: "wm_consumer.id")
-        req.setValue("Bearer YOUR-JWT-TOKEN-HERE",          // ← TODO ②
-                     forHTTPHeaderField: "Authorization")
-
-        let session = URLSession(configuration: .default,
-                                 delegate: InsecureTLSDelegate(),
-                                 delegateQueue: nil)
-
-        session.dataTask(with: req) { data, _, error in
-            if let error { log("❌ \(error.localizedDescription)"); return }
-            guard let data else { log("❌ No data"); return }
-
-            // ▸ outer wrapper JSON (for context)
-            log("✅ Response (outer JSON)\n\(prettyPrintedJSON(from: data) ?? "<non-JSON>")")
-
-            // ▸ inner payload
-            log(unpackPayload(from: data))
-        }.resume()
-    }
-
-    private func log(_ text: String) {
-        DispatchQueue.main.async { console = text; print(text) }
-    }
-}
-
-// ──────────────────────────────────────────────────────────────
-// MARK: – TLS delegate that blindly trusts the staging cert
-
-final class InsecureTLSDelegate: NSObject, URLSessionDelegate {
-    func urlSession(_ s: URLSession, didReceive c: URLAuthenticationChallenge,
-                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-        if let trust = c.protectionSpace.serverTrust {
-            completionHandler(.useCredential, URLCredential(trust: trust))
-        } else {
-            completionHandler(.performDefaultHandling, nil)
-        }
-    }
-}
-
-// ──────────────────────────────────────────────────────────────
-// MARK: – Payload decoding helpers
-
-/// Pretty-prints if JSON
-private func prettyPrintedJSON(from data: Data) -> String? {
-    guard
-        let obj    = try? JSONSerialization.jsonObject(with: data),
-        let pretty = try? JSONSerialization.data(withJSONObject: obj, options: .prettyPrinted),
-        let str    = String(data: pretty, encoding: .utf8)
-    else { return nil }
-    return str
-}
-
-/// Pull `"payload"` → base-64 → gunzip → JSON / UTF-8 / Float32 preview
-private func unpackPayload(from root: Data) -> String {
-
-    // 1. unwrap & base-64
-    guard
-        let wrap = try? JSONSerialization.jsonObject(with: root) as? [String: Any],
-        let b64  = wrap["payload"] as? String,
-        let gz   = Data(base64Encoded: b64)
-    else { return "❌ no payload or base-64 decode failed" }
-
-    // 2. full gzip inflate (handles header & footer)
-    guard let raw = gz.fullGunzip() else {
-        return "❌ gunzip failed – got \(gz.count) bytes"
-    }
-
-    // 3. JSON?
-    if let pretty = prettyPrintedJSON(from: raw) {
-        return "📦 Inner payload (JSON, \(raw.count) bytes)\n\(pretty)"
-    }
-
-    // 4. UTF-8 text?
-    if let str = String(data: raw, encoding: .utf8), str.isMostlyPrintable {
-        return "📦 Inner payload (text, \(raw.count) bytes)\n\(str)"
-    }
-
-    // 5. Looks like Float32 embeddings?
-    if raw.count % 4 == 0 {
-        let n = raw.count / 4
-        var v = [Float](repeating: 0, count: n)
-        _ = v.withUnsafeMutableBytes { raw.copyBytes(to: $0) }
-        let preview = v.prefix(10).map { String(format: "%.4f", $0) }.joined(separator: ", ")
-        return "📦 \(n) Float32 values. First 10 → [\(preview)]"
-    }
-
-    // 6. unknown binary
-    return "📦 Inner payload is \(raw.count) binary bytes (unknown format)"
-}
-
-// ──────────────────────────────────────────────────────────────
-// MARK: – GZIP helper (works on every iOS version)
-
 private extension Data {
+
     /// Full GZIP inflator using zlib (windowBits = 16 + MAX_WBITS)
     func fullGunzip() -> Data? {
         guard !isEmpty else { return self }
 
+        // ── 1. initialise stream ─────────────────────────────
         var stream = z_stream()
-        stream.next_in   = UnsafeMutablePointer<Bytef>(mutating: (self as NSData).bytes.bindMemory(to: Bytef.self, capacity: count))
-        stream.avail_in  = uint(count)
+        stream.next_in = UnsafeMutablePointer<Bytef>(mutating:
+            (self as NSData).bytes.bindMemory(to: Bytef.self, capacity: count))
+        stream.avail_in = uInt(count)
 
-        let windowBits = 16 + MAX_WBITS      // +16 = accept gzip header/trailer
-        guard inflateInit2_(&stream, Int32(windowBits), ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size)) == Z_OK
-        else { return nil }
+        let windowBits = 16 + MAX_WBITS            // +16 = accept gzip header/trailer
+        guard inflateInit2_(&stream,
+                            Int32(windowBits),
+                            ZLIB_VERSION,
+                            Int32(MemoryLayout<z_stream>.size)) == Z_OK else { return nil }
 
-        var out = Data(capacity: count * 2)
-        let chunk = 16 * 1024
-        var status: Int32
+        // ── 2. inflate in 16 KB chunks ───────────────────────
+        var output = Data()
+        let chunkSize = 16 * 1024
+        var status: Int32 = Z_OK
 
-        repeat {
-            var buffer = [UInt8](repeating: 0, count: chunk)
-            stream.next_out  = &buffer
-            stream.avail_out = uInt(chunk)
+        while status == Z_OK {
+            var buffer = [UInt8](repeating: 0, count: chunkSize)
 
-            status = inflate(&stream, Z_NO_FLUSH)
-            let have = chunk - Int(stream.avail_out)
-            out.append(buffer, count: have)
+            // hand the buffer’s raw pointer to zlib
+            buffer.withUnsafeMutableBytes { outPtr in
+                stream.next_out  = outPtr.bindMemory(to: Bytef.self).baseAddress
+                stream.avail_out = uInt(chunkSize)
 
-        } while status == Z_OK
+                status = inflate(&stream, Z_NO_FLUSH)
+
+                let written = chunkSize - Int(stream.avail_out)
+                output.append(outPtr.baseAddress!.assumingMemoryBound(to: UInt8.self),
+                              count: written)
+            }
+        }
 
         inflateEnd(&stream)
-        return status == Z_STREAM_END ? out : nil
-    }
-}
-
-// crude ASCII-printability test
-private extension String {
-    var isMostlyPrintable: Bool {
-        let printable = filter { ($0.asciiValue ?? 0) >= 32 && ($0.asciiValue ?? 0) <= 126 }
-        return Double(printable.count) / Double(count) > 0.8
+        return status == Z_STREAM_END ? output : nil
     }
 }
