@@ -1,14 +1,29 @@
-// 1) Drop this type anywhere in the same file
-final class InsecureTLSDelegate: NSObject, URLSessionDelegate {
-    func urlSession(_ session: URLSession,
-                    didReceive challenge: URLAuthenticationChallenge,
-                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+private func fetch() {
+    guard let url = URL(string:
+        "https://developer.api.us.stg.walmart.com/api-proxy/service/COMPASS/SERVICE/v4/embeddings/upc?upc_id=7062240121"
+    ) else { return }
 
-        if let trust = challenge.protectionSpace.serverTrust {
-            // Accept *whatever* the server presents
-            completionHandler(.useCredential, URLCredential(trust: trust))
+    var request = URLRequest(url: url)
+    request.httpMethod = "GET"
+    request.setValue("YOUR-CONSUMER-ID-HERE", forHTTPHeaderField: "wm_consumer.id")
+    request.setValue("Bearer YOUR-JWT-TOKEN-HERE", forHTTPHeaderField: "Authorization")
+
+    // ⟹ use a custom session that trusts the staging cert
+    let session = URLSession(configuration: .default,
+                             delegate: InsecureTLSDelegate(),
+                             delegateQueue: nil)
+
+    session.dataTask(with: request) { data, response, error in
+        if let error { log("❌ \(error.localizedDescription)"); return }
+        guard let data else { log("❌ No data"); return }
+
+        if let pretty = prettyPrintedJSON(from: data) {
+            log("✅ Response (auto-unzipped)\n\(pretty)")
+        } else if let gunzipped = data.gunzip(),
+                  let pretty = prettyPrintedJSON(from: gunzipped) {
+            log("✅ Response (manual gunzip)\n\(pretty)")
         } else {
-            completionHandler(.performDefaultHandling, nil)
+            log("⚠️ Could not decode JSON – raw bytes count: \(data.count)")
         }
-    }
+    }.resume()
 }
