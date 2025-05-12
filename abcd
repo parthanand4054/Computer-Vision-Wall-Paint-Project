@@ -1,44 +1,89 @@
-#!/bin/bash
-# Save as process_embeddings.sh
+import SwiftUI
+import Compression
 
-# First, extract the payload field from the JSON response
-echo "Fetching and processing embeddings..."
-RESPONSE=$(curl -s --location 'https://developer.api.us.stg.walmart.com/api-proxy/service/COMPASS/SERVICE/v4/embeddings/upc?upc_id=7062240121' \
---header 'wm_consumer.id: c061c52a-b978-4ae9-9875-6584e58e8a74' \
---header 'Authorization: Bearer eyJraWQiOiJKOTY5MzBhY...')
+struct ContentView: View {
+    @State private var console = "Fetching…"
 
-# Check if the response contains "status":"OK"
-if [[ $RESPONSE != *'"status":"OK"'* ]]; then
-    echo "Error in API response:"
-    echo "$RESPONSE"
-    exit 1
-fi
+    var body: some View {
+        ScrollView {                     // simple on-screen log (optional)
+            Text(console)
+                .font(.system(.body, design: .monospaced))
+                .padding()
+        }
+        .onAppear { fetch() }            // fire once at launch
+    }
 
-# Extract the payload using sed
-PAYLOAD=$(echo "$RESPONSE" | sed -n 's/.*"payload":"\([^"]*\)".*/\1/p')
+    // MARK: – Networking
+    private func fetch() {
+        guard let url = URL(string:
+            "https://developer.api.us.stg.walmart.com/api-proxy/service/COMPASS/SERVICE/v4/embeddings/upc?upc_id=7062240121"
+        ) else { return }
 
-if [ -z "$PAYLOAD" ]; then
-    echo "Failed to extract payload from response"
-    exit 1
-fi
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue(
+            "YOUR-CONSUMER-ID-HERE",                 // TODO ①
+            forHTTPHeaderField: "wm_consumer.id"
+        )
+        request.setValue(
+            "Bearer YOUR-JWT-TOKEN-HERE",           // TODO ②
+            forHTTPHeaderField: "Authorization"
+        )
 
-echo "Payload extracted successfully."
+        // URLSession transparently ungzips when the server sets `Content-Encoding: gzip`
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error { log("❌ \(error.localizedDescription)") ; return }
+            guard let data else { log("❌ No data") ; return }
 
-# Decode Base64 and decompress
-echo "$PAYLOAD" | base64 --decode > embeddings.gz
-gunzip -f embeddings.gz
+            // If URLSession already decompressed, this succeeds; otherwise fallback to manual gunzip
+            if let pretty = prettyPrintedJSON(from: data) {
+                log("✅ Response (decompressed automatically)\n\(pretty)")
+            } else if let gunzipped = data.gunzip(),
+                      let pretty = prettyPrintedJSON(from: gunzipped) {
+                log("✅ Response (manual gunzip)\n\(pretty)")
+            } else {
+                log("⚠️ Could not decode JSON – raw bytes count: \(data.count)")
+            }
+        }.resume()
+    }
 
-# Check if decompression worked
-if [ -f embeddings ]; then
-    echo "Successfully decoded and decompressed the payload."
-    echo "First few lines of the embeddings:"
-    head -n 20 embeddings
-    echo "..."
-    echo "Full embeddings saved to 'embeddings' file"
-else
-    echo "Failed to decompress the payload"
-    
-    # Save the Base64 decoded data for inspection
-    echo "$PAYLOAD" | base64 --decode > raw_payload.bin
-    echo "Raw decoded payload saved to 'raw_payload.bin'"
-fi
+    // MARK: – Helpers
+    private func log(_ text: String) {
+        DispatchQueue.main.async { console = text ; print(text) }
+    }
+}
+
+import Foundation
+
+/// Pretty-print any JSON blob so it’s readable in the console
+private func prettyPrintedJSON(from data: Data) -> String? {
+    guard let obj = try? JSONSerialization.jsonObject(with: data),
+          let pretty = try? JSONSerialization.data(withJSONObject: obj, options: .prettyPrinted),
+          let str = String(data: pretty, encoding: .utf8) else { return nil }
+    return str
+}
+
+/// Very small gzip-decompressor using Apple’s Compression framework
+private extension Data {
+    func gunzip() -> Data? {
+        guard !isEmpty else { return self }
+
+        return withUnsafeBytes { (srcPtr: UnsafeRawBufferPointer) -> Data? in
+            guard let srcBase = srcPtr.baseAddress else { return nil }
+            // Allocate a worst-case 4× buffer; adjust if you know the size
+            let dstSize = count * 4
+            let dstPtr = UnsafeMutablePointer<UInt8>.allocate(capacity: dstSize)
+            defer { dstPtr.deallocate() }
+
+            let decompressed = compression_decode_buffer(
+                dstPtr, dstSize,
+                srcBase.assumingMemoryBound(to: UInt8.self), count,
+                nil,
+                COMPRESSION_ZLIB       // gzip uses the deflate algorithm
+            )
+
+            guard decompressed != 0 else { return nil }
+            return Data(bytes: dstPtr, count: decompressed)
+        }
+    }
+}
