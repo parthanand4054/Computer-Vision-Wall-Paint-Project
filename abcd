@@ -1,40 +1,139 @@
-/// Extracts `"payload"` → base-64 → gunzip → pretty-print (if JSON)
-private func unpackPayload(from root: Data) -> String? {
+import SwiftUI
+import Compression       // for manual fallback if needed
 
-    // 1️⃣ Outer JSON
-    guard
-        let obj = try? JSONSerialization.jsonObject(with: root) as? [String: Any]
-    else { return "❌ outer JSON parse failed" }
+struct ContentView: View {
+    @State private var console = "Fetching…"
 
-    guard
-        let payloadB64 = obj["payload"] as? String
-    else { return "❌ no \"payload\" key in outer JSON" }
+    var body: some View {
+        ScrollView {
+            Text(console)
+                .font(.system(.body, design: .monospaced))
+                .padding()
+        }
+        .onAppear { fetch() }
+    }
 
-    // 2️⃣ Base-64 decode
-    guard
-        let gzData = Data(base64Encoded: payloadB64)
-    else { return "❌ base-64 decode failed (length \(payloadB64.count))" }
+    // MARK: – Networking
+    private func fetch() {
+        guard let url = URL(string:
+            "https://developer.api.us.stg.walmart.com/api-proxy/service/COMPASS/SERVICE/v4/embeddings/upc?upc_id=7062240121"
+        ) else { return }
 
-    // 3️⃣ Gunzip  ➜  if this fails we’ll try the raw bytes as JSON
-    let raw = gzData.gunzip() ?? gzData
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue("YOUR-CONSUMER-ID-HERE",                 // TODO Ⓐ
+                     forHTTPHeaderField: "wm_consumer.id")
+        req.setValue("Bearer YOUR-JWT-TOKEN-HERE",            // TODO Ⓑ
+                     forHTTPHeaderField: "Authorization")
 
-    // 4️⃣ Pretty-print if JSON, otherwise dump some stats
-    if let pretty = prettyPrintedJSON(from: raw) {
-        return "📦 Inner payload (JSON, \(raw.count) bytes)\n\(pretty)"
-    } else if let str = String(data: raw, encoding: .utf8), str.isPrintable {
-        return "📦 Inner payload (UTF-8 text, \(raw.count) bytes)\n\(str)"
-    } else {
-        return "📦 Inner payload is \(raw.count) binary bytes (non-JSON/non-UTF-8)"
+        let session = URLSession(configuration: .default,
+                                 delegate: InsecureTLSDelegate(),
+                                 delegateQueue: nil)
+
+        session.dataTask(with: req) { data, _, error in
+            if let error { log("❌ \(error.localizedDescription)"); return }
+            guard let data else { log("❌ No data"); return }
+
+            // 1️⃣ show wrapper JSON
+            log("✅ Response (outer JSON)\n\(prettyPrintedJSON(from: data) ?? "<non-JSON>")")
+
+            // 2️⃣ dive into payload
+            log(unpackPayload(from: data))
+        }.resume()
+    }
+
+    private func log(_ text: String) {
+        DispatchQueue.main.async { console = text; print(text) }
     }
 }
 
+// ────────────────────────── TLS delegate (unchanged)
 
+final class InsecureTLSDelegate: NSObject, URLSessionDelegate {
+    func urlSession(_ s: URLSession, didReceive c: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        if let trust = c.protectionSpace.serverTrust {
+            completionHandler(.useCredential, URLCredential(trust: trust))
+        } else {
+            completionHandler(.performDefaultHandling, nil)
+        }
+    }
+}
 
+// ────────────────────────── Helpers
 
+/// Pretty-print if JSON
+private func prettyPrintedJSON(from data: Data) -> String? {
+    guard
+        let obj = try? JSONSerialization.jsonObject(with: data),
+        let pretty = try? JSONSerialization.data(withJSONObject: obj, options: .prettyPrinted),
+        let str = String(data: pretty, encoding: .utf8)
+    else { return nil }
+    return str
+}
+
+/// Decode → gunzip (Foundation first, manual fallback) → interpret
+private func unpackPayload(from root: Data) -> String {
+    // 1. pull out "payload"
+    guard
+        let wrapper = try? JSONSerialization.jsonObject(with: root) as? [String: Any],
+        let b64     = wrapper["payload"] as? String,
+        let gzData  = Data(base64Encoded: b64)
+    else { return "❌ no payload / base-64 decode failed" }
+
+    // 2. try Foundation’s built-in gzip decompressor
+    let raw: Data
+    if let z = try? gzData.decompressed(using: .gzip) {
+        raw = z
+    } else {
+        // fallback: deflate only (old helper)
+        raw = gzData.gunzipFallback() ?? gzData
+    }
+
+    // 3. JSON?
+    if let pretty = prettyPrintedJSON(from: raw) {
+        return "📦 Inner payload (JSON, \(raw.count) bytes)\n\(pretty)"
+    }
+
+    // 4. Printable text?
+    if let str = String(data: raw, encoding: .utf8), str.isMostlyPrintable {
+        return "📦 Inner payload (UTF-8 text, \(raw.count) bytes)\n\(str)"
+    }
+
+    // 5. Floats?
+    if raw.count % 4 == 0 {
+        let floatCount = raw.count / 4
+        var floats = [Float](repeating: 0, count: floatCount)
+        _ = floats.withUnsafeMutableBytes { raw.copyBytes(to: $0) }
+        let preview = floats.prefix(10).map { String(format: "%.4f", $0) }.joined(separator: ", ")
+        return "📦 Inner payload = \(floatCount) Float32s. First 10 → [\(preview)]"
+    }
+
+    // 6. give up
+    return "📦 Inner payload is \(raw.count) binary bytes (unknown format)"
+}
+
+// fallback deflate (same as before, renamed)
+private extension Data {
+    func gunzipFallback() -> Data? {
+        guard !isEmpty else { return self }
+        return withUnsafeBytes { src -> Data? in
+            guard let srcBase = src.baseAddress else { return nil }
+            let dstCap = count * 4
+            let dst = UnsafeMutablePointer<UInt8>.allocate(capacity: dstCap)
+            defer { dst.deallocate() }
+            let len = compression_decode_buffer(dst, dstCap,
+                                                srcBase.assumingMemoryBound(to: UInt8.self), count,
+                                                nil, COMPRESSION_ZLIB)
+            return len == 0 ? nil : Data(bytes: dst, count: len)
+        }
+    }
+}
+
+// crude “is it mostly ASCII printable?”
 private extension String {
-    /// crude check: printable if at least 80 % of chars are ASCII 32…126
-    var isPrintable: Bool {
-        let printable = filter { $0.asciiValue ?? 0 >= 32 && $0.asciiValue ?? 0 <= 126 }
-        return Double(printable.count) / Double(count) > 0.8
+    var isMostlyPrintable: Bool {
+        let p = filter { ($0.asciiValue ?? 0) >= 32 && ($0.asciiValue ?? 0) <= 126 }
+        return Double(p.count) / Double(count) > 0.8
     }
 }
